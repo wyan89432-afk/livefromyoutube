@@ -13,60 +13,36 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
       - name: Install tools
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl unzip
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.deno/bin:$PATH"
-          deno --version
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade 'yt-dlp[default]' yt-dlp-ejs
+          sudo apt-get install -y ffmpeg curl python3-pip
+          python3 -m pip install --user --break-system-packages -U yt-dlp
           yt-dlp --version
 
-      - name: Prepare optional YouTube cookies
+      - name: Download latest video to temporary storage
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           set -euo pipefail
           rm -rf /tmp/youtube
           mkdir -p /tmp/youtube
-          if [ -n "$YOUTUBE_COOKIES" ]; then
-            printf '%s\n' "$YOUTUBE_COOKIES" > /tmp/youtube/cookies.txt
-            chmod 600 /tmp/youtube/cookies.txt
-            echo 'YouTube cookies loaded from GitHub Secret.'
+          if [ -n "${YOUTUBE_COOKIES:-}" ]; then
+            printf '%s' "$YOUTUBE_COOKIES" > /tmp/youtube/cookies.txt
+            COOKIE_ARGS=(--cookies /tmp/youtube/cookies.txt)
           else
-            echo 'No YOUTUBE_COOKIES secret found; trying without cookies.'
+            COOKIE_ARGS=()
           fi
-
-      - name: Download latest video to temporary storage
-        run: |
-          set -euo pipefail
-          args=(
-            --js-runtimes deno
-            --remote-components ejs:npm
-            --playlist-end 1
-            --no-part
-            --restrict-filenames
-            --max-filesize 1G
-            --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
-            --merge-output-format mp4
-            --output '/tmp/youtube/%(id)s.%(ext)s'
-          )
-          if [ -s /tmp/youtube/cookies.txt ]; then
-            args+=(--cookies /tmp/youtube/cookies.txt)
-          fi
-          yt-dlp "${args[@]}" 'https://www.youtube.com/@myanmar3dfree003/videos'
+          yt-dlp "${COOKIE_ARGS[@]}" \
+            --no-part \
+            --restrict-filenames \
+            --max-filesize 1G \
+            --playlist-end 1 \
+            --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b' \
+            --merge-output-format mp4 \
+            --output '/tmp/youtube/video.%(ext)s' \
+            'https://www.youtube.com/@myanmar3dfree003/videos'
 
       - name: Upload to Telegram
         env:
@@ -74,50 +50,34 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$TELEGRAM_BOT_TOKEN" || { echo 'TELEGRAM_BOT_TOKEN secret is missing'; exit 1; }
-          shopt -s nullglob
-          files=(/tmp/youtube/*.mp4)
-          test ${#files[@]} -gt 0 || { echo 'No MP4 video was downloaded'; exit 1; }
-          for file in "${files[@]}"; do
+          FILE=$(find /tmp/youtube -maxdepth 1 -type f -name 'video.mp4' -print -quit)
+          test -f "$FILE" || { echo 'No video was downloaded'; exit 1; }
+          SIZE=$(stat -c%s "$FILE")
+          if [ "$SIZE" -le 49000000 ]; then
+            curl --fail --show-error --retry 5 --retry-delay 5 \
+              -X POST \
+              -F 'chat_id=@happydayfor' \
+              -F "video=@$FILE" \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
+          else
             mkdir -p /tmp/youtube/parts
-            size=$(stat -c%s "$file")
-            if [ "$size" -le 49000000 ]; then
+            ffmpeg -hide_banner -loglevel error -y -i "$FILE" -map 0 -c copy \
+              -f segment -segment_time 300 -reset_timestamps 1 -segment_format mp4 \
+              '/tmp/youtube/parts/part_%03d.mp4'
+            for part in /tmp/youtube/parts/*.mp4; do
+              if [ "$(stat -c%s "$part")" -gt 49000000 ]; then
+                echo "Telegram part exceeds 49 MB: $part"
+                exit 1
+              fi
               curl --fail --show-error --retry 5 --retry-delay 5 \
                 -X POST \
                 -F 'chat_id=@happydayfor' \
-                -F "video=@$file" \
+                -F "video=@$part" \
+                -F "caption=$(basename "$part")" \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
-            else
-              bitrate=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$file" || true)
-              [[ "$bitrate" =~ ^[0-9]+$ ]] || bitrate=4000000
-              seg_time=$((40*1024*1024*8/bitrate))
-              [ "$seg_time" -ge 10 ] || seg_time=10
-              ok=0
-              for attempt in 1 2 3 4 5; do
-                rm -f /tmp/youtube/parts/*.mp4
-                ffmpeg -hide_banner -loglevel error -y -i "$file" -map 0 -c copy \
-                  -f segment -segment_time "$seg_time" -reset_timestamps 1 -segment_format mp4 \
-                  '/tmp/youtube/parts/part_%03d.mp4'
-                bad=0
-                for part in /tmp/youtube/parts/*.mp4; do
-                  [ "$(stat -c%s "$part")" -le 49000000 ] || bad=1
-                done
-                if [ "$bad" -eq 0 ]; then ok=1; break; fi
-                seg_time=$((seg_time*70/100))
-              done
-              [ "$ok" -eq 1 ] || { echo 'Could not create Telegram-safe parts'; exit 1; }
-              for part in /tmp/youtube/parts/*.mp4; do
-                curl --fail --show-error --retry 5 --retry-delay 5 \
-                  -X POST \
-                  -F 'chat_id=@happydayfor' \
-                  -F "video=@$part" \
-                  -F "caption=$(basename "$file") - $(basename "$part")" \
-                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
-                sleep 2
-              done
-            fi
-            rm -f "$file"
-            rm -rf /tmp/youtube/parts
-          done
+              sleep 2
+            done
+          fi
 
       - name: Cleanup
         if: always()
