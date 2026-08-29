@@ -1,84 +1,34 @@
-name: YouTube to Telegram
+name: YouTube Link to Telegram
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '15 * * * *'
 
-permissions:
-  contents: read
-
 jobs:
-  download-and-upload:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 330
+  send-link:
+    runs-on: ubuntu-latest
     steps:
-      - name: Install tools
+      - name: Install yt-dlp
+        run: python3 -m pip install --user --break-system-packages -U yt-dlp
+
+      - name: Get latest video link
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg curl python3-pip
-          python3 -m pip install --user --break-system-packages -U yt-dlp
-          yt-dlp --version
+          yt-dlp --flat-playlist --playlist-end 1 --print webpage_url \
+            'https://www.youtube.com/@myanmar3dfree003/videos' > /tmp/video_url.txt
+          URL=$(head -n 1 /tmp/video_url.txt)
+          test -n "$URL" || { echo 'No YouTube video found'; exit 1; }
+          echo "VIDEO_URL=$URL" >> "$GITHUB_ENV"
 
-      - name: Download latest video to temporary storage
-        env:
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/youtube
-          mkdir -p /tmp/youtube
-          if [ -n "${YOUTUBE_COOKIES:-}" ]; then
-            printf '%s' "$YOUTUBE_COOKIES" > /tmp/youtube/cookies.txt
-            COOKIE_ARGS=(--cookies /tmp/youtube/cookies.txt)
-          else
-            COOKIE_ARGS=()
-          fi
-          yt-dlp "${COOKIE_ARGS[@]}" \
-            --no-part \
-            --restrict-filenames \
-            --max-filesize 1G \
-            --playlist-end 1 \
-            --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b' \
-            --merge-output-format mp4 \
-            --output '/tmp/youtube/video.%(ext)s' \
-            'https://www.youtube.com/@myanmar3dfree003/videos'
-
-      - name: Upload to Telegram
+      - name: Send link to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           set -euo pipefail
           test -n "$TELEGRAM_BOT_TOKEN" || { echo 'TELEGRAM_BOT_TOKEN secret is missing'; exit 1; }
-          FILE=$(find /tmp/youtube -maxdepth 1 -type f -name 'video.mp4' -print -quit)
-          test -f "$FILE" || { echo 'No video was downloaded'; exit 1; }
-          SIZE=$(stat -c%s "$FILE")
-          if [ "$SIZE" -le 49000000 ]; then
-            curl --fail --show-error --retry 5 --retry-delay 5 \
-              -X POST \
-              -F 'chat_id=@happydayfor' \
-              -F "video=@$FILE" \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
-          else
-            mkdir -p /tmp/youtube/parts
-            ffmpeg -hide_banner -loglevel error -y -i "$FILE" -map 0 -c copy \
-              -f segment -segment_time 300 -reset_timestamps 1 -segment_format mp4 \
-              '/tmp/youtube/parts/part_%03d.mp4'
-            for part in /tmp/youtube/parts/*.mp4; do
-              if [ "$(stat -c%s "$part")" -gt 49000000 ]; then
-                echo "Telegram part exceeds 49 MB: $part"
-                exit 1
-              fi
-              curl --fail --show-error --retry 5 --retry-delay 5 \
-                -X POST \
-                -F 'chat_id=@happydayfor' \
-                -F "video=@$part" \
-                -F "caption=$(basename "$part")" \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
-              sleep 2
-            done
-          fi
-
-      - name: Cleanup
-        if: always()
-        run: rm -rf /tmp/youtube
+          curl --fail --show-error \
+            -X POST \
+            -d "chat_id=@happydayfor" \
+            --data-urlencode "text=📺 New video: $VIDEO_URL" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
