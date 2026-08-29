@@ -6,7 +6,7 @@ on:
     - cron: '0 * * * *'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: youtube-to-telegram
@@ -17,9 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Install tools
         run: |
           sudo apt-get update
@@ -32,20 +29,14 @@ jobs:
         run: |
           rm -rf /tmp/youtube
           mkdir -p /tmp/youtube
-          if [ -f .github/youtube-download-archive.txt ]; then
-            cp .github/youtube-download-archive.txt /tmp/youtube/archive.txt
-          else
-            : > /tmp/youtube/archive.txt
-          fi
 
-      - name: Find and download latest new YouTube videos
+      - name: Download latest YouTube videos
         env:
           YOUTUBE_URL: https://youtube.com/@myanmar3dfree003/videos
         run: |
           set -euo pipefail
           yt-dlp \
-            --download-archive /tmp/youtube/archive.txt \
-            --playlist-end 5 \
+            --playlist-end 1 \
             --no-part \
             --restrict-filenames \
             --max-filesize 1G \
@@ -54,19 +45,18 @@ jobs:
             --output '/tmp/youtube/%(id)s.%(ext)s' \
             "$YOUTUBE_URL"
 
-      - name: Upload videos to Telegram
+      - name: Upload video to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: '@happydayfor'
         run: |
           set -euo pipefail
           test -n "$TELEGRAM_BOT_TOKEN" || { echo 'Missing TELEGRAM_BOT_TOKEN secret'; exit 1; }
-
           shopt -s nullglob
           files=(/tmp/youtube/*.mp4)
           if [ ${#files[@]} -eq 0 ]; then
-            echo 'No new videos found.'
-            exit 0
+            echo 'No video downloaded.'
+            exit 1
           fi
 
           for file in "${files[@]}"; do
@@ -82,16 +72,10 @@ jobs:
             else
               rm -rf /tmp/youtube/parts
               mkdir -p /tmp/youtube/parts
-
-              duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$file" || true)
               bitrate=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$file" || true)
               if [ -z "$bitrate" ] || [ "$bitrate" = 'N/A' ] || ! [[ "$bitrate" =~ ^[0-9]+$ ]]; then
                 bitrate=4000000
               fi
-              if [ -z "$duration" ] || [ "$duration" = 'N/A' ]; then
-                duration=60
-              fi
-
               seg_time=$(python3 - "$bitrate" <<'PY'
 import sys
 bitrate=int(sys.argv[1])
@@ -99,7 +83,6 @@ target=40*1024*1024
 print(max(10, int(target*8/bitrate)))
 PY
 )
-
               success=0
               for attempt in 1 2 3 4 5 6; do
                 rm -f /tmp/youtube/parts/*.mp4
@@ -108,7 +91,6 @@ PY
                   -f segment -segment_time "$seg_time" -reset_timestamps 1 \
                   -segment_format mp4 \
                   '/tmp/youtube/parts/part_%03d.mp4'
-
                 oversized=0
                 for part in /tmp/youtube/parts/*.mp4; do
                   [ "$(stat -c%s "$part")" -le 49000000 ] || oversized=1
@@ -116,11 +98,8 @@ PY
                 if [ "$oversized" -eq 0 ]; then success=1; break; fi
                 seg_time=$((seg_time * 70 / 100))
               done
-
-              [ "$success" -eq 1 ] || { echo 'Unable to split video below 49 MB.'; exit 1; }
-
+              [ "$success" -eq 1 ] || { echo 'Unable to split video below Telegram 50 MB limit.'; exit 1; }
               for part in /tmp/youtube/parts/*.mp4; do
-                echo "Uploading $(basename "$part")"
                 curl --fail --silent --show-error --retry 5 --retry-delay 5 \
                   -X POST \
                   -F "chat_id=$TELEGRAM_CHAT_ID" \
@@ -130,20 +109,8 @@ PY
                 sleep 3
               done
             fi
-            rm -f "$file"
-            rm -rf /tmp/youtube/parts
           done
 
-      - name: Save download history
-        if: success()
-        run: |
-          cp /tmp/youtube/archive.txt .github/youtube-download-archive.txt
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .github/youtube-download-archive.txt
-          git diff --cached --quiet || git commit -m 'Update YouTube download history'
-          git push
-
-      - name: Delete all temporary files
+      - name: Delete temporary files
         if: always()
         run: rm -rf /tmp/youtube /tmp/yt-dlp-venv
