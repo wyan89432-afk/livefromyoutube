@@ -1,0 +1,54 @@
+name: YouTube to Telegram
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python3 -m pip install --upgrade yt-dlp
+
+      - name: Download YouTube video to temporary runner storage
+        env:
+          YOUTUBE_URL: ${{ secrets.YOUTUBE_URL }}
+        run: |
+          test -n "$YOUTUBE_URL" || { echo 'Missing YOUTUBE_URL secret'; exit 1; }
+          mkdir -p /tmp/youtube
+          yt-dlp \
+            --no-part \
+            --no-keep-video \
+            -f 'bv*+ba/b' \
+            --merge-output-format mp4 \
+            -o '/tmp/youtube/video.%(ext)s' \
+            "$YOUTUBE_URL"
+
+      - name: Upload video to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo 'Missing TELEGRAM_BOT_TOKEN secret'; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo 'Missing TELEGRAM_CHAT_ID secret'; exit 1; }
+          FILE=$(find /tmp/youtube -type f -name 'video.*' | head -n 1)
+          test -f "$FILE" || { echo 'Downloaded video not found'; exit 1; }
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -F "chat_id=$TELEGRAM_CHAT_ID" \
+            -F "document=@$FILE" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+
+      - name: Delete temporary video
+        if: always()
+        run: rm -rf /tmp/youtube
