@@ -6,49 +6,144 @@ on:
     - cron: '0 * * * *'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: youtube-to-telegram
+  cancel-in-progress: false
 
 jobs:
   download-and-upload:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
-          python3 -m pip install --upgrade yt-dlp
+          python3 -m venv /tmp/yt-dlp-venv
+          /tmp/yt-dlp-venv/bin/pip install --upgrade pip yt-dlp
+          echo "/tmp/yt-dlp-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Download YouTube video to temporary runner storage
+      - name: Prepare download archive
+        run: |
+          mkdir -p /tmp/youtube
+          if [ -f .github/youtube-download-archive.txt ]; then
+            cp .github/youtube-download-archive.txt /tmp/youtube/archive.txt
+          else
+            : > /tmp/youtube/archive.txt
+          fi
+
+      - name: Download latest new YouTube videos
         env:
           YOUTUBE_URL: ${{ secrets.YOUTUBE_URL }}
         run: |
-          test -n "$YOUTUBE_URL" || { echo 'Missing YOUTUBE_URL secret'; exit 1; }
-          mkdir -p /tmp/youtube
+          test -n "$YOUTUBE_URL" || { echo "Missing YOUTUBE_URL secret"; exit 1; }
           yt-dlp \
+            --download-archive /tmp/youtube/archive.txt \
+            --playlist-end 5 \
             --no-part \
-            --no-keep-video \
-            -f 'bv*+ba/b' \
+            --restrict-filenames \
+            --max-filesize 1G \
+            -f 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b' \
             --merge-output-format mp4 \
-            -o '/tmp/youtube/video.%(ext)s' \
+            -o '/tmp/youtube/%(id)s.%(ext)s' \
             "$YOUTUBE_URL"
 
-      - name: Upload video to Telegram
+      - name: Upload videos to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          test -n "$TELEGRAM_BOT_TOKEN" || { echo 'Missing TELEGRAM_BOT_TOKEN secret'; exit 1; }
-          test -n "$TELEGRAM_CHAT_ID" || { echo 'Missing TELEGRAM_CHAT_ID secret'; exit 1; }
-          FILE=$(find /tmp/youtube -type f -name 'video.*' | head -n 1)
-          test -f "$FILE" || { echo 'Downloaded video not found'; exit 1; }
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing TELEGRAM_BOT_TOKEN secret"; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo "Missing TELEGRAM_CHAT_ID secret"; exit 1; }
 
-          curl --fail --silent --show-error \
-            -X POST \
-            -F "chat_id=$TELEGRAM_CHAT_ID" \
-            -F "document=@$FILE" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+          shopt -s nullglob
+          files=(/tmp/youtube/*.mp4)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No new videos found."
+            exit 0
+          fi
 
-      - name: Delete temporary video
+          for file in "${files[@]}"; do
+            size=$(stat -c%s "$file")
+            echo "Processing $(basename "$file") - $size bytes"
+
+            if [ "$size" -le 52428800 ]; then
+              curl --fail --silent --show-error --retry 3 --retry-delay 5 \
+                -X POST \
+                -F "chat_id=$TELEGRAM_CHAT_ID" \
+                -F "video=@$file" \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
+            else
+              rm -rf /tmp/youtube/parts
+              mkdir -p /tmp/youtube/parts
+
+              bitrate=$(ffprobe -v error -show_entries format=bit_rate \
+                -of default=noprint_wrappers=1:nokey=1 "$file" || true)
+              if [ -z "$bitrate" ] || [ "$bitrate" = "N/A" ] || [ "$bitrate" -le 0 ]; then
+                bitrate=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate \
+                  -of default=noprint_wrappers=1:nokey=1 "$file" || true)
+              fi
+              if [ -z "$bitrate" ] || [ "$bitrate" = "N/A" ] || [ "$bitrate" -le 0 ]; then
+                bitrate=4000000
+              fi
+
+              seg_time=$(python3 - "$bitrate" <<'PY'
+import sys
+bitrate = int(sys.argv[1])
+target = 42 * 1024 * 1024
+print(max(15, int(target * 8 / bitrate)))
+PY
+)
+
+              for attempt in 1 2 3 4 5; do
+                rm -f /tmp/youtube/parts/*.mp4
+                ffmpeg -hide_banner -loglevel error -y \
+                  -i "$file" -map 0 -c copy \
+                  -f segment -segment_time "$seg_time" -reset_timestamps 1 \
+                  -segment_format mp4 \
+                  "/tmp/youtube/parts/part_%03d.mp4"
+
+                oversized=0
+                for part in /tmp/youtube/parts/*.mp4; do
+                  [ "$(stat -c%s "$part")" -le 49200000 ] || oversized=1
+                done
+                [ "$oversized" -eq 0 ] && break
+                seg_time=$((seg_time * 70 / 100))
+              done
+
+              for part in /tmp/youtube/parts/*.mp4; do
+                psize=$(stat -c%s "$part")
+                if [ "$psize" -gt 52428800 ]; then
+                  echo "ERROR: Could not split $(basename "$file") below Telegram's 50 MB bot limit."
+                  exit 1
+                fi
+                curl --fail --silent --show-error --retry 3 --retry-delay 5 \
+                  -X POST \
+                  -F "chat_id=$TELEGRAM_CHAT_ID" \
+                  -F "video=@$part" \
+                  -F "caption=$(basename "$file") - $(basename "$part")" \
+                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
+                sleep 4
+              done
+            fi
+            rm -f "$file"
+          done
+
+      - name: Save download archive
+        if: success()
+        run: |
+          cp /tmp/youtube/archive.txt .github/youtube-download-archive.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/youtube-download-archive.txt
+          git diff --cached --quiet || git commit -m "Update YouTube download archive"
+          git push
+
+      - name: Delete temporary files
         if: always()
-        run: rm -rf /tmp/youtube
+        run: rm -rf /tmp/youtube /tmp/yt-dlp-venv
