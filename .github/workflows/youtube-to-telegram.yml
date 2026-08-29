@@ -34,22 +34,39 @@ jobs:
           python -m pip install --upgrade 'yt-dlp[default]' yt-dlp-ejs
           yt-dlp --version
 
-      - name: Download latest video to temporary storage
+      - name: Prepare optional YouTube cookies
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           set -euo pipefail
           rm -rf /tmp/youtube
           mkdir -p /tmp/youtube
-          yt-dlp \
-            --js-runtimes deno \
-            --remote-components ejs:npm \
-            --playlist-end 1 \
-            --no-part \
-            --restrict-filenames \
-            --max-filesize 1G \
-            --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b' \
-            --merge-output-format mp4 \
-            --output '/tmp/youtube/%(id)s.%(ext)s' \
-            'https://www.youtube.com/@myanmar3dfree003/videos'
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            printf '%s\n' "$YOUTUBE_COOKIES" > /tmp/youtube/cookies.txt
+            chmod 600 /tmp/youtube/cookies.txt
+            echo 'YouTube cookies loaded from GitHub Secret.'
+          else
+            echo 'No YOUTUBE_COOKIES secret found; trying without cookies.'
+          fi
+
+      - name: Download latest video to temporary storage
+        run: |
+          set -euo pipefail
+          args=(
+            --js-runtimes deno
+            --remote-components ejs:npm
+            --playlist-end 1
+            --no-part
+            --restrict-filenames
+            --max-filesize 1G
+            --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+            --merge-output-format mp4
+            --output '/tmp/youtube/%(id)s.%(ext)s'
+          )
+          if [ -s /tmp/youtube/cookies.txt ]; then
+            args+=(--cookies /tmp/youtube/cookies.txt)
+          fi
+          yt-dlp "${args[@]}" 'https://www.youtube.com/@myanmar3dfree003/videos'
 
       - name: Upload to Telegram
         env:
