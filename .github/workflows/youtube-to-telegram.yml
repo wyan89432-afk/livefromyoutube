@@ -2,6 +2,8 @@ name: YouTube to Telegram
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   schedule:
     - cron: '0 * * * *'
 
@@ -19,6 +21,7 @@ jobs:
     steps:
       - name: Install tools
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl python3-venv
           python3 -m venv /tmp/yt-dlp-venv
@@ -26,13 +29,15 @@ jobs:
           echo "/tmp/yt-dlp-venv/bin" >> "$GITHUB_PATH"
 
       - name: Prepare temporary workspace
-        run: |
-          rm -rf /tmp/youtube
-          mkdir -p /tmp/youtube
+        run: mkdir -p /tmp/youtube
 
-      - name: Download latest YouTube videos
-        env:
-          YOUTUBE_URL: https://youtube.com/@myanmar3dfree003/videos
+      - name: Check YouTube channel
+        run: |
+          set -euo pipefail
+          echo 'Checking YouTube channel...'
+          yt-dlp --flat-playlist --playlist-end 1 --print '%(id)s' 'https://www.youtube.com/@myanmar3dfree003/videos'
+
+      - name: Download latest YouTube video
         run: |
           set -euo pipefail
           yt-dlp \
@@ -43,7 +48,7 @@ jobs:
             --format 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b' \
             --merge-output-format mp4 \
             --output '/tmp/youtube/%(id)s.%(ext)s' \
-            "$YOUTUBE_URL"
+            'https://www.youtube.com/@myanmar3dfree003/videos'
 
       - name: Upload video to Telegram
         env:
@@ -54,15 +59,10 @@ jobs:
           test -n "$TELEGRAM_BOT_TOKEN" || { echo 'Missing TELEGRAM_BOT_TOKEN secret'; exit 1; }
           shopt -s nullglob
           files=(/tmp/youtube/*.mp4)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo 'No video downloaded.'
-            exit 1
-          fi
+          test ${#files[@]} -gt 0 || { echo 'No video downloaded.'; exit 1; }
 
           for file in "${files[@]}"; do
             size=$(stat -c%s "$file")
-            echo "Processing $(basename "$file") ($size bytes)"
-
             if [ "$size" -le 49000000 ]; then
               curl --fail --silent --show-error --retry 5 --retry-delay 5 \
                 -X POST \
@@ -73,23 +73,18 @@ jobs:
               rm -rf /tmp/youtube/parts
               mkdir -p /tmp/youtube/parts
               bitrate=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$file" || true)
-              if [ -z "$bitrate" ] || [ "$bitrate" = 'N/A' ] || ! [[ "$bitrate" =~ ^[0-9]+$ ]]; then
-                bitrate=4000000
-              fi
+              if [ -z "$bitrate" ] || [ "$bitrate" = 'N/A' ] || ! [[ "$bitrate" =~ ^[0-9]+$ ]]; then bitrate=4000000; fi
               seg_time=$(python3 - "$bitrate" <<'PY'
 import sys
 bitrate=int(sys.argv[1])
-target=40*1024*1024
-print(max(10, int(target*8/bitrate)))
+print(max(10, int((40*1024*1024)*8/bitrate)))
 PY
 )
               success=0
               for attempt in 1 2 3 4 5 6; do
                 rm -f /tmp/youtube/parts/*.mp4
-                ffmpeg -hide_banner -loglevel error -y \
-                  -i "$file" -map 0 -c copy \
-                  -f segment -segment_time "$seg_time" -reset_timestamps 1 \
-                  -segment_format mp4 \
+                ffmpeg -hide_banner -loglevel error -y -i "$file" -map 0 -c copy \
+                  -f segment -segment_time "$seg_time" -reset_timestamps 1 -segment_format mp4 \
                   '/tmp/youtube/parts/part_%03d.mp4'
                 oversized=0
                 for part in /tmp/youtube/parts/*.mp4; do
@@ -98,7 +93,7 @@ PY
                 if [ "$oversized" -eq 0 ]; then success=1; break; fi
                 seg_time=$((seg_time * 70 / 100))
               done
-              [ "$success" -eq 1 ] || { echo 'Unable to split video below Telegram 50 MB limit.'; exit 1; }
+              [ "$success" -eq 1 ] || { echo 'Unable to split video below 49 MB.'; exit 1; }
               for part in /tmp/youtube/parts/*.mp4; do
                 curl --fail --silent --show-error --retry 5 --retry-delay 5 \
                   -X POST \
@@ -106,9 +101,11 @@ PY
                   -F "video=@$part" \
                   -F "caption=$(basename "$file") - $(basename "$part")" \
                   "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo"
-                sleep 3
+                sleep 2
               done
             fi
+            rm -f "$file"
+            rm -rf /tmp/youtube/parts
           done
 
       - name: Delete temporary files
